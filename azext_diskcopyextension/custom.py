@@ -141,11 +141,14 @@ def start_blob_copy(source_resource_group, source_storage_account_name, source_c
                         '--destination-container', destination_container,
                         '--destination-blob', destination_blob], env=env)
   return blob_copy
-def get_storage_account_key(resource_group, storage_account):
-  logger.info('Retrieving storage account key for %s in resource group %s', storage_account, resource_group)
+
+def get_storage_account_key(storage_account):
+  storage_account_name = storage_account['name']
+  storage_account_rg = storage_account['resourceGroup']
+  logger.info('Retrieving storage account key for %s in resource group %s', storage_account_name, storage_account_rg)
   key = az_cli(['storage', 'account', 'keys', 'list',
-                  '-g', resource_group,
-                  '-n', storage_account])
+                  '-g', storage_account_rg,
+                  '-n', storage_account_name])
   return key[0]['value']
 
 def start_blob_copy_with_sas(snapshot_blob_sas, blob_name, target_storage_account_name, target_storage_account_key, target_storage_container_name):
@@ -163,7 +166,6 @@ def start_blob_copy_with_sas(snapshot_blob_sas, blob_name, target_storage_accoun
                         '--account-key', target_storage_account_key,
                         '-c', target_storage_container_name])
   return blob_copy
-
 
 def get_storage_blob(blob_uri):
   blob_match = blob_regex.match(blob_uri)
@@ -193,6 +195,19 @@ def get_matching_disk_sku(source_storage_acct):
   else:
     disk_sku = 'Standard_LRS'
   return disk_sku
+
+def wait_for_blob_success(blob_uri):
+  # TODO: for very long running copies, it might be better to register a function + event grid listener, but this works to start
+  while True:
+    blob = get_storage_blob(blob_uri)
+    copy_status = blob['properties']['copy']['status']
+    # TODO: give better status - percent or number of bytes/blocks
+    logger.info('%s: Waiting for %s to copy. Current status is %s', time.ctime(), blob['name'], copy_status)
+    if copy_status == 'success':
+      break
+    time.sleep(5)
+  
+  return blob
 
 def sameregion_copy_vhd_to_disk(source_vhd_uri, source_storage_acct, target_resource_group_name, target_disk_name, target_disk_sku):
   logger.info('Copying within the same region (%s)', source_storage_acct['location'])
@@ -230,7 +245,7 @@ def crossregion_copy_vhd_to_disk(source_vhd_uri, blob_match, source_storage_acct
     if copy_status == 'success':
       break
     time.sleep(5)
-
+  # TODO: Cleanup storage accounts and snapshots
   # Create a disk from the temporary blob
   disk = create_disk_from_blob(temp_blob_uri, target_rg['name'], target_disk_name, target_disk_sku)
   return disk
@@ -291,9 +306,9 @@ def crossregion_copy_disk_to_disk(source_resource_group_name, source_disk_name, 
   source_snapshot = create_snapshot_from_disk(source_snapshot_name, source_resource_group_name, source_disk_name)
 
   temp_storage_acct_name = 'diskmigration{0}'.format(random.randint(0, 100000)) 
-  create_or_use_storage_account(temp_storage_acct_name, target_resource_group_name)
+  temp_storage_acct = create_or_use_storage_account(temp_storage_acct_name, target_resource_group_name)
 
-  temp_storage_acct_key = get_storage_account_key(target_resource_group_name, temp_storage_acct_name)
+  temp_storage_acct_key = get_storage_account_key(temp_storage_acct)
   
   temp_blob_container_name = 'temp'
   create_blob_container(temp_storage_acct_name, temp_blob_container_name)
@@ -304,14 +319,7 @@ def crossregion_copy_disk_to_disk(source_resource_group_name, source_disk_name, 
   start_blob_copy_with_sas(blob_sas, temp_blob_name, temp_storage_acct_name, temp_storage_acct_key, temp_blob_container_name)
   temp_blob_uri ='https://{0}.blob.core.windows.net/{1}/{2}'.format(temp_storage_acct_name, temp_blob_container_name, temp_blob_name)
   # TODO: for very long running copies, it might be better to register a function + event grid listener, but this works to start
-  while True:
-    temp_blob = get_storage_blob(temp_blob_uri)
-    copy_status = temp_blob['properties']['copy']['status']
-    # TODO: give better status - percent or number of bytes/blocks
-    logger.info('%s: Waiting for %s to copy. Current status is %s', time.ctime(), temp_blob['name'], copy_status)
-    if copy_status == 'success':
-      break
-    time.sleep(5)
+  wait_for_blob_success(temp_blob_uri)
 
   # Create a disk from the temporary blob
   disk = create_disk_from_blob(temp_blob_uri, target_resource_group_name, target_disk_name, target_disk_sku)
@@ -319,7 +327,26 @@ def crossregion_copy_disk_to_disk(source_resource_group_name, source_disk_name, 
   return disk
 
 def copy_disk_to_vhd(source_resource_group_name, source_disk_name, target_storage_account_name, target_storage_container_name, target_vhd_name):
-  raise NotImplementedError('Managed Disk:VHD copy not implemented yet')
+  # TODO: Move to validator
+  source_rg = assert_resource_group(source_resource_group_name)
+  storage_acct = assert_storage_account(target_storage_account_name)
+
+  source_disk = get_disk(source_resource_group_name, source_disk_name)
+  if not source_disk:
+    raise CLIError('{0} does not exist in resource group {1}.'.format(source_disk_name, source_resource_group_name))
+
+  source_snapshot_name = 'snapshot_{0}'.format(random.randint(0, 100000))
+  source_snapshot = create_snapshot_from_disk(source_snapshot_name, source_resource_group_name, source_disk_name)
+
+  storage_acct_key = get_storage_account_key(storage_acct)
+  blob_sas = get_snapshot_blob_sas(source_snapshot['id'])
+
+  start_blob_copy_with_sas(blob_sas, target_vhd_name, target_storage_account_name, storage_acct_key, target_storage_container_name)
+  
+  blob_uri ='https://{0}.blob.core.windows.net/{1}/{2}'.format(target_storage_account_name, target_storage_container_name, target_vhd_name)
+  blob = wait_for_blob_success(blob_uri)
+  
+  return blob
 
 def copy_disk_to_disk(source_resource_group_name, source_disk_name, target_resource_group_name, target_disk_name):
   # Check that destination RG exists
@@ -345,6 +372,6 @@ def copy_disk_to_disk(source_resource_group_name, source_disk_name, target_resou
     logger.info('Performing a cross-region copy (%s to %s)', source_rg['location'], target_rg['location'])
     # Create a disk from the temporary blob
     disk = crossregion_copy_disk_to_disk(source_resource_group_name, source_disk_name, target_resource_group_name, target_disk_name, target_disk_sku)
-    # TODO: Cleanup storage accounts and snapshots
+
   return disk
 
