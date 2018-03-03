@@ -290,6 +290,8 @@ def copy_vhd_to_vhd(source_vhd_uri, target_storage_account_name, target_storage_
   blob_uri ='https://{0}.blob.core.windows.net/{1}/{2}'.format(target_storage_account_name, target_storage_container_name, target_vhd_name)
   blob = wait_for_blob_success(blob_uri)
   
+  # Clean up blob snapshot
+  delete_blob_snapshot(source_vhd_uri, blob_snapshot['snapshot'])
   return blob
   
 def copy_vhd_to_disk(source_vhd_uri, target_resource_group_name, 
@@ -401,17 +403,24 @@ def copy_disk_to_vhd(source_resource_group_name, source_disk_name, target_storag
   if not source_disk:
     raise CLIError('{0} does not exist in resource group {1}.'.format(source_disk_name, source_resource_group_name))
 
+  # Create a snapshot
   source_snapshot_name = 'snapshot_{0}'.format(random.randint(0, 100000))
   source_snapshot = create_snapshot_from_disk(source_snapshot_name, source_resource_group_name, source_disk_name)
 
-  storage_acct_key = get_storage_account_key(storage_acct['resourceGroup'], storage_acct['name'])
+  # Generate a limited-time SAS url to access the source snapshot 
   blob_sas = get_sas_for_snapshot(source_snapshot['id'])
 
+  # Copy to blob to target storage account
+  storage_acct_key = get_storage_account_key(storage_acct['resourceGroup'], storage_acct['name'])
   start_blob_copy_with_sas(blob_sas, target_vhd_name, target_storage_account_name, storage_acct_key, target_storage_container_name)
-  
   blob_uri ='https://{0}.blob.core.windows.net/{1}/{2}'.format(target_storage_account_name, target_storage_container_name, target_vhd_name)
   blob = wait_for_blob_success(blob_uri)
   
+  # Revoke SAS after copy
+  revoke_sas_for_snapshot(source_snapshot['id'])
+
+  # Clean up snapshot
+  delete_resource(source_snapshot['id'])
   return blob
 
 def copy_disk_to_disk(source_resource_group_name, source_disk_name, target_resource_group_name, 
