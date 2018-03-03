@@ -118,6 +118,31 @@ def create_or_use_storage_account(storage_account_name, resource_group_name):
                             '--encryption-services', 'blob'])
   return storage_account
 
+def start_blob_copy_to_destination(source_resource_group, source_storage_account_name, blob_match, source_snapshot, 
+                    target_storage_account_name, destination_container, destination_blob):
+  source_container = blob_match.group('container')
+  source_blob = blob_match.group('blob')
+
+  logger.info('Copying %s to %s', source_blob, target_storage_account_name)
+  
+  source_storage_account_keys = az_cli(['storage', 'account', 'keys', 'list',
+                                        '-n', source_storage_account_name,
+                                        '-g', source_resource_group])
+  source_storage_account_key = source_storage_account_keys[0]['value']
+  
+
+  env = {}
+  env['AZURE_STORAGE_ACCOUNT'] = target_storage_account_name
+  blob_copy = az_cli(['storage', 'blob', 'copy', 'start',
+                        '--source-account-name', source_storage_account_name,
+                        '--source-account-key', source_storage_account_key,
+                        '--source-container', source_container,
+                        '--source-blob', source_blob,
+                        '--source-snapshot', source_snapshot,
+                        '--destination-container', destination_container,
+                        '--destination-blob', destination_blob], env=env)
+  return blob_copy
+
 def start_blob_copy(source_resource_group, source_storage_account_name, source_container, source_blob, source_snapshot, 
                     target_storage_account_name):
   logger.info('Copying %s to %s', source_blob, target_storage_account_name)
@@ -128,6 +153,7 @@ def start_blob_copy(source_resource_group, source_storage_account_name, source_c
   source_storage_account_key = source_storage_account_keys[0]['value']
   
   destination_container = source_container
+
   destination_blob = source_blob
 
   env = {}
@@ -251,7 +277,20 @@ def crossregion_copy_vhd_to_disk(source_vhd_uri, blob_match, source_storage_acct
   return disk
 
 def copy_vhd_to_vhd(source_vhd_uri, target_storage_account_name, target_storage_container_name, target_vhd_name):
-  raise NotImplementedError('VHD:VHD copy not implemented yet')
+  blob_match = blob_regex.match(source_vhd_uri)
+  if not blob_match:
+    raise CLIError('--source-uri did not match format of a blob URI')
+
+  blob_snapshot = create_blob_snapshot(source_vhd_uri)
+  # Ensure that the source storage account exists
+  source_storage_acct_name = blob_match.group('storage_account')
+  source_storage_acct = assert_storage_account(source_storage_acct_name)
+
+  start_blob_copy_to_destination(source_storage_acct['resourceGroup'], source_storage_acct_name, blob_match, blob_snapshot['snapshot'], target_storage_account_name, target_storage_container_name, target_vhd_name)
+  blob_uri ='https://{0}.blob.core.windows.net/{1}/{2}'.format(target_storage_account_name, target_storage_container_name, target_vhd_name)
+  blob = wait_for_blob_success(blob_uri)
+  
+  return blob
   
 def copy_vhd_to_disk(source_vhd_uri, target_resource_group_name, 
                       target_disk_name=None, target_disk_sku=None, temp_storage_account_name=None):
